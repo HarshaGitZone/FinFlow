@@ -4,3 +4,4 @@ backend/node_modules/
 backend/.env
 DEPLOYMENT_GUIDE.md
 STOCK_PORTFOLIO_README.md
+.gitattributes
