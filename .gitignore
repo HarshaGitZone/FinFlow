@@ -2,3 +2,5 @@ frontend/node_modules/
 frontend/.env
 backend/node_modules/
 backend/.env
+DEPLOYMENT_GUIDE.md
+STOCK_PORTFOLIO_README.md
