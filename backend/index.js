@@ -1,0 +1,1229 @@
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
+const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
+const multer = require('multer');
+const csv = require('csv-parser');
+const { Readable } = require('stream');
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/finance-tracker';
+const IMPORT_CONCURRENCY = Math.max(1, Number(process.env.IMPORT_CONCURRENCY || 8));
+const MAX_IMPORT_CONCURRENCY = Math.max(1, Number(process.env.MAX_IMPORT_CONCURRENCY || 16));
+const SUMMARY_CACHE_TTL_MS = Math.max(1000, Number(process.env.SUMMARY_CACHE_TTL_MS || 30000));
+const ANALYTICS_CACHE_TTL_MS = Math.max(1000, Number(process.env.ANALYTICS_CACHE_TTL_MS || 30000));
+const summaryCache = new Map();
+const analyticsCache = new Map();
+
+const trustProxyConfig = process.env.TRUST_PROXY ?? (process.env.NODE_ENV === 'production' ? '1' : '0');
+if (trustProxyConfig === 'true') {
+  app.set('trust proxy', true);
+} else {
+  const trustProxyHops = Number(trustProxyConfig);
+  if (!Number.isNaN(trustProxyHops) && trustProxyHops > 0) {
+    app.set('trust proxy', trustProxyHops);
+  }
+}
+
+const corsOptions = {
+  origin: process.env.NODE_ENV === 'production'
+    ? [process.env.FRONTEND_URL, 'https://finflow-steel-delta.vercel.app']
+    : ['http://localhost:3000', 'http://localhost:5173'],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
+const connectWithRetry = async (retries = 5, delayMs = 5000) => {
+  try {
+    const maskedHost = (MONGODB_URI || '').split('@').pop()?.split('/')[0] || 'localhost';
+    console.log('Connecting to Mongo host (masked):', maskedHost);
+
+    await mongoose.connect(MONGODB_URI, {
+      serverSelectionTimeoutMS: 10000
+    });
+
+    console.log('Connected to MongoDB');
+
+    try {
+      await mongoose.connection.collection('transactions').dropIndex('fingerprint_1');
+      console.log('Fixed: Dropped global fingerprint index');
+    } catch (e) {
+      // Ignore if index doesn't exist
+    }
+
+    // Start server after DB connection
+    app.listen(PORT, () => {
+      console.log(`Server is running on port ${PORT} (env: ${process.env.PORT || 'default'})`);
+    });
+  } catch (err) {
+    console.error('MongoDB connection error:', err?.message || err);
+    if (retries > 0) {
+      console.log(`Retrying MongoDB connection in ${delayMs}ms (${retries} retries left)`);
+      setTimeout(() => connectWithRetry(retries - 1, delayMs), delayMs);
+    } else {
+      console.error('Failed to connect to MongoDB after multiple attempts');
+      // Exit process so deploy platform can restart if configured
+      process.exit(1);
+    }
+  }
+};
+
+connectWithRetry();
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+const buildCacheKey = (userId, suffix = 'all') => `${String(userId)}::${suffix}`;
+
+const getCachedValue = (cache, key) => {
+  const cached = cache.get(key);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    cache.delete(key);
+    return null;
+  }
+  return cached.value;
+};
+
+const setCachedValue = (cache, key, value, ttlMs) => {
+  cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+};
+
+const invalidateUserCaches = (userId) => {
+  const prefix = `${String(userId)}::`;
+  for (const key of summaryCache.keys()) {
+    if (key.startsWith(prefix)) summaryCache.delete(key);
+  }
+  for (const key of analyticsCache.keys()) {
+    if (key.startsWith(prefix)) analyticsCache.delete(key);
+  }
+};
+
+const normalizeField = (value) => String(value || '').trim().toLowerCase();
+
+const buildTransactionFingerprint = (transaction) => {
+  const dateIso = transaction.date instanceof Date ? transaction.date.toISOString() : new Date(transaction.date).toISOString();
+  const rawKey = [
+    dateIso,
+    Number(transaction.amount).toFixed(2),
+    normalizeField(transaction.type),
+    normalizeField(transaction.description),
+    normalizeField(transaction.category)
+  ].join('|');
+  return crypto.createHash('sha256').update(rawKey).digest('hex');
+};
+
+const runWithConcurrency = async (items, concurrency, handler) => {
+  let index = 0;
+  const worker = async () => {
+    while (true) {
+      const current = index;
+      index += 1;
+      if (current >= items.length) break;
+      await handler(items[current]);
+    }
+  };
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+  await Promise.all(workers);
+};
+
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-in-production', (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid token' });
+    }
+    req.userId = user.userId || user.id;
+    if (!req.userId) {
+      return res.status(403).json({ error: 'Invalid token payload' });
+    }
+    next();
+  });
+};
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+const transactionSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  date: { type: Date, required: true },
+  amount: { type: Number, required: true },
+  type: { type: String, enum: ['income', 'expense'], required: true },
+  category: { type: String, required: true },
+  description: { type: String, required: true },
+  tags: [String],
+  fingerprint: { type: String, required: true },
+  isDeleted: { type: Boolean, default: false },
+  debtId: { type: mongoose.Schema.Types.ObjectId, ref: 'Debt' },
+  debtPaymentId: { type: mongoose.Schema.Types.ObjectId, ref: 'DebtPayment' }
+}, { timestamps: true });
+
+transactionSchema.index({ userId: 1, fingerprint: 1 }, { unique: true });
+transactionSchema.index({ userId: 1, isDeleted: 1 });
+transactionSchema.index({ date: -1 });
+
+const Transaction = mongoose.model('Transaction', transactionSchema);
+
+// Import models
+const User = require('./src/models/User');
+const SalaryPlanner = require('./src/models/SalaryPlanner');
+const Debt = require('./src/models/Debt');
+const DebtPayment = require('./src/models/DebtPayment');
+const Budget = require('./src/models/Budget');
+const ImportHistory = require('./src/models/ImportHistory');
+const Portfolio = require('./src/models/Portfolio');
+const { ImportCommitQueue } = require('./src/utils/importCommitQueue');
+const importCommitQueue = new ImportCommitQueue();
+
+// Import controllers
+const { register, login, getProfile, updateProfile, updatePassword } = require('./src/controllers/authController');
+const salaryPlannerController = require('./src/controllers/salaryPlannerController');
+const debtController = require('./src/controllers/debtController');
+const analyticsController = require('./src/controllers/analyticsController');
+const portfolioController = require('./src/controllers/portfolioController');
+
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: process.env.NODE_ENV === 'production' ? 300 : 1200,
+  message: 'Too many requests from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) =>
+    req.method === 'OPTIONS' ||
+    req.path === '/api/auth/login' ||
+    req.path === '/api/auth/register'
+});
+
+const normalizeLimiterEmail = (email) => String(email || '').trim().toLowerCase();
+
+const authLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: process.env.NODE_ENV === 'production' ? 20 : 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  keyGenerator: (req) => {
+    const email = normalizeLimiterEmail(req.body?.email);
+    return `${req.ip}::${email || 'unknown-email'}`;
+  },
+  message: {
+    success: false,
+    message: 'Too many login attempts. Please wait 15 minutes and try again.'
+  }
+});
+
+const authRegisterLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: process.env.NODE_ENV === 'production' ? 10 : 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `${req.ip}::register`,
+  message: {
+    success: false,
+    message: 'Too many signup attempts. Please wait and try again.'
+  }
+});
+
+app.use((req, res, next) => {
+  if (req.path.includes('/api/csv/')) {
+    req.setTimeout(120000); // 2 minutes for CSV operations
+  } else {
+    req.setTimeout(30000); // 30 seconds for other operations
+  }
+  next();
+});
+
+app.use(helmet());
+app.use(compression());
+if (process.env.ENABLE_HTTP_LOGS === 'true') {
+  app.use(morgan('combined'));
+}
+app.use(globalLimiter);
+app.use('/api/auth/login', authLoginLimiter);
+app.use('/api/auth/register', authRegisterLimiter);
+
+// Pass Transaction model to debt controller
+app.use((req, res, next) => {
+  req.app.locals.Transaction = Transaction;
+  req.app.locals.analyticsCache = analyticsCache;
+  req.app.locals.analyticsCacheTTLms = ANALYTICS_CACHE_TTL_MS;
+  next();
+});
+
+app.on('transaction-updated', (payload) => {
+  if (payload?.userId) {
+    invalidateUserCaches(payload.userId);
+  }
+});
+
+// Helper for Robust Date Parsing
+const parseDate = (dateStr) => {
+  if (!dateStr) return null;
+  const cleanStr = dateStr.toString().trim();
+
+  // Try ISO format first (YYYY-MM-DD)
+  let date = new Date(cleanStr);
+  if (!isNaN(date.getTime())) return date;
+
+  // Try DD/MM/YYYY or DD-MM-YYYY
+  const dmyMatch = cleanStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+  if (dmyMatch) {
+    const day = parseInt(dmyMatch[1], 10);
+    const month = parseInt(dmyMatch[2], 10) - 1; // Months are 0-indexed
+    const year = parseInt(dmyMatch[3], 10);
+    date = new Date(year, month, day);
+    if (!isNaN(date.getTime())) return date;
+  }
+
+  // Try MM/DD/YYYY or MM-DD-YYYY
+  const mdyMatch = cleanStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+  if (mdyMatch) {
+    const month = parseInt(mdyMatch[1], 10) - 1;
+    const day = parseInt(mdyMatch[2], 10);
+    const year = parseInt(mdyMatch[3], 10);
+    date = new Date(year, month, day);
+    if (!isNaN(date.getTime())) return date;
+  }
+
+  return null;
+};
+
+// CSV Preview Endpoint
+app.post('/api/csv/preview', authenticateToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const page = parseInt(req.body.page) || 1;
+    const limit = parseInt(req.body.limit) || 20;
+    const skip = (page - 1) * limit;
+
+    const results = [];
+    const headers = [];
+    let headerCaptured = false;
+    let rowCount = 0;
+    let totalRows = 0;
+
+    const stream = Readable.from(req.file.buffer.toString());
+
+    await new Promise((resolve, reject) => {
+      stream
+        .pipe(csv())
+        .on('data', (data) => {
+          if (!headerCaptured) {
+            headers.push(...Object.keys(data));
+            headerCaptured = true;
+          }
+
+          totalRows++;
+
+          // Only store rows for the current page
+          if (totalRows > skip && results.length < limit) {
+            results.push(data);
+          }
+        })
+        .on('end', resolve)
+        .on('error', reject);
+    });
+
+    res.json({
+      headers,
+      data: results,
+      pagination: {
+        page: page,
+        limit: limit,
+        totalRows: totalRows,
+        totalPages: Math.ceil(totalRows / limit),
+        hasNextPage: page < Math.ceil(totalRows / limit),
+        hasPrevPage: page > 1
+      }
+    });
+  } catch (error) {
+    console.error('CSV preview error:', error);
+    res.status(500).json({ error: 'Failed to parse CSV file' });
+  }
+});
+
+// CSV Import with Column Mapping & History
+app.post('/api/csv/import', authenticateToken, upload.single('file'), async (req, res) => {
+  try {
+    console.log('CSV import request received');
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const { columnMapping } = req.body;
+    console.log('Column mapping received:', columnMapping);
+
+    if (!columnMapping) {
+      return res.status(400).json({ error: 'Column mapping is required' });
+    }
+
+    const mapping = JSON.parse(columnMapping);
+    const results = [];
+    const errors = [];
+    let processedRows = 0;
+    let skippedRows = 0;
+    let duplicateRows = 0;
+
+    const stream = Readable.from(req.file.buffer.toString());
+
+    await new Promise((resolve, reject) => {
+      stream
+        .pipe(csv())
+        .on('data', (data) => {
+          try {
+            processedRows++;
+
+            const parsedDate = parseDate(data[mapping.date]);
+            const amountStr = (data[mapping.amount] || '0').toString().replace(/[^0-9.-]+/g, '');
+            const parsedAmount = parseFloat(amountStr);
+
+            // Map CSV columns to transaction fields
+            const transaction = {
+              userId: req.userId,
+              date: parsedDate,
+              amount: isNaN(parsedAmount) ? 0 : parsedAmount,
+              type: (data[mapping.type] || 'expense').toLowerCase(),
+              category: data[mapping.category] || 'Uncategorized',
+              description: data[mapping.description] || '',
+              tags: [],
+              rowNumber: processedRows
+            };
+
+            // Validate required fields
+            if (!transaction.date || isNaN(transaction.date.getTime())) {
+              errors.push({ row: processedRows, error: 'Invalid date format' });
+              skippedRows++;
+              return;
+            }
+
+            if (transaction.amount <= 0) {
+              errors.push({ row: processedRows, error: 'Invalid amount' });
+              skippedRows++;
+              return;
+            }
+
+            if (!['income', 'expense'].includes(transaction.type)) {
+              transaction.type = 'expense';
+            }
+
+            // Generate deterministic fingerprint for deduplication
+            transaction.fingerprint = buildTransactionFingerprint(transaction);
+
+            results.push(transaction);
+          } catch (error) {
+            console.error('Error processing row:', error);
+            errors.push({ row: processedRows, error: error.message });
+            skippedRows++;
+          }
+        })
+        .on('end', resolve)
+        .on('error', (error) => {
+          console.error('CSV parsing error:', error);
+          reject(error);
+        });
+    });
+
+    console.log(`Processed ${processedRows} rows, ${results.length} valid transactions, ${errors.length} errors`);
+
+    const importSessionId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
+
+    const responseData = await importCommitQueue.enqueue(req.userId, async ({ commitOrder }) => {
+      let insertedCount = 0;
+      if (results.length > 0) {
+        const requestedConcurrency = Number(req.body?.concurrency);
+        const effectiveConcurrency = Number.isFinite(requestedConcurrency)
+          ? Math.max(1, Math.min(MAX_IMPORT_CONCURRENCY, Math.trunc(requestedConcurrency)))
+          : IMPORT_CONCURRENCY;
+        const sortedResults = [...results].sort((a, b) => a.rowNumber - b.rowNumber);
+        let individualSuccess = 0;
+        const uniqueFingerprints = Array.from(new Set(sortedResults.map((record) => record.fingerprint)));
+        let existingTransactions = [];
+        try {
+          existingTransactions = await Transaction.find({
+            userId: req.userId,
+            fingerprint: { $in: uniqueFingerprints }
+          }).maxTimeMS(15000);
+        } catch (findExistingErr) {
+          console.error('Failed to prefetch existing transactions for dedupe:', findExistingErr.message);
+        }
+
+        const existingByFingerprint = new Map(
+          existingTransactions.map((existingTx) => [existingTx.fingerprint, existingTx])
+        );
+        const seenNewFingerprints = new Set();
+        const rowsToInsert = [];
+        const rowsToRestore = [];
+
+        for (const record of sortedResults) {
+          const existing = existingByFingerprint.get(record.fingerprint);
+          if (existing) {
+            if (existing.isDeleted) {
+              rowsToRestore.push({ existing, record });
+              existing.isDeleted = false;
+            } else {
+              duplicateRows++;
+            }
+            continue;
+          }
+
+          if (seenNewFingerprints.has(record.fingerprint)) {
+            duplicateRows++;
+            continue;
+          }
+
+          seenNewFingerprints.add(record.fingerprint);
+          rowsToInsert.push(record);
+        }
+
+        for (const restoreItem of rowsToRestore) {
+          try {
+            const { existing, record } = restoreItem;
+            existing.isDeleted = false;
+            existing.amount = record.amount;
+            existing.date = record.date;
+            existing.type = record.type;
+            existing.category = record.category;
+            existing.description = record.description;
+            await existing.save();
+            individualSuccess++;
+            insertedCount++;
+          } catch (restoreErr) {
+            console.error(`Failed to restore deleted duplicate for row ${restoreItem.record.rowNumber}:`, restoreErr.message);
+            errors.push({ row: restoreItem.record.rowNumber, error: restoreErr.message });
+          }
+        }
+
+        await runWithConcurrency(rowsToInsert, effectiveConcurrency, async (record) => {
+          try {
+            await new Transaction(record).save();
+            individualSuccess++;
+            insertedCount++;
+          } catch (indErr) {
+            if (indErr.code === 11000) {
+              duplicateRows++;
+            } else {
+              console.error(`Individual save error for row ${record.rowNumber}:`, indErr.message);
+              errors.push({ row: record.rowNumber, error: indErr.message });
+            }
+          }
+        });
+        console.log(`Bounded-concurrency import finished. CommitOrder: ${commitOrder}, Concurrency: ${effectiveConcurrency}, Success: ${individualSuccess}, Duplicates: ${duplicateRows}, Errors: ${errors.length}`);
+
+        if (insertedCount > 0) {
+          const categoriesToUpdate = new Set();
+          results.forEach((transaction) => {
+            if (transaction.type === 'expense') {
+              categoriesToUpdate.add(transaction.category);
+            }
+          });
+
+          for (const category of categoriesToUpdate) {
+            await updateBudgetSpentAmount(req.userId, category);
+          }
+
+          req.app.emit('transaction-updated', {
+            userId: req.userId,
+            action: 'import',
+            count: insertedCount,
+            categories: Array.from(categoriesToUpdate)
+          });
+        }
+      }
+
+      let status = 'failed';
+      if (errors.length === 0) {
+        if (insertedCount > 0 || duplicateRows > 0) {
+          status = 'success';
+        }
+      } else if (insertedCount > 0 || duplicateRows > 0) {
+        status = 'partial';
+      }
+
+      try {
+        await ImportHistory.create({
+          userId: req.userId,
+          fileName: req.file.originalname,
+          importSessionId,
+          commitOrder,
+          commitPolicy: 'per-user-serialized',
+          status,
+          summary: {
+            totalRows: processedRows,
+            insertedRows: insertedCount,
+            skippedRows,
+            duplicateRows,
+            errors: errors.length
+          }
+        });
+      } catch (histError) {
+        console.error('Failed to save import history:', histError);
+      }
+
+      return {
+        success: status === 'success' || status === 'partial',
+        commit: {
+          importSessionId,
+          commitOrder,
+          policy: 'per-user-serialized'
+        },
+        summary: {
+          totalRows: processedRows,
+          insertedRows: insertedCount,
+          skippedRows,
+          duplicateRows,
+          errors: errors.length
+        },
+        errors: errors.slice(0, 50),
+        debug: {
+          userId: req.userId,
+          resultsLength: results.length,
+          processedRows,
+          duplicateRows,
+          insertedCount
+        }
+      };
+    });
+
+    console.log('Sending response:', responseData);
+    res.status(200).json(responseData);
+
+  } catch (error) {
+    console.error('CSV import error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: 'Failed to import CSV file',
+        details: error.message
+      });
+    }
+  }
+});
+
+// CSV Dry Run Validation
+app.post('/api/csv/dry-run', authenticateToken, upload.single('file'), async (req, res) => {
+  try {
+    console.log('Dry run request received');
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const { columnMapping } = req.body;
+    if (!columnMapping) {
+      return res.status(400).json({ error: 'Column mapping is required' });
+    }
+
+    const mapping = JSON.parse(columnMapping);
+    const validTransactions = [];
+    const errors = [];
+    let processedRows = 0;
+    let duplicateCount = 0;
+    const allTransactions = [];
+
+    const stream = Readable.from(req.file.buffer.toString());
+
+    await new Promise((resolve, reject) => {
+      stream
+        .pipe(csv())
+        .on('data', (data) => {
+          try {
+            processedRows++;
+
+            const parsedDate = parseDate(data[mapping.date]);
+            const amountStr = (data[mapping.amount] || '0').toString().replace(/[^0-9.-]+/g, '');
+            const parsedAmount = parseFloat(amountStr);
+
+            // Map CSV columns to transaction fields
+            const transaction = {
+              userId: req.userId,
+              date: parsedDate,
+              amount: isNaN(parsedAmount) ? 0 : parsedAmount,
+              type: (data[mapping.type] || 'expense').toLowerCase(),
+              category: data[mapping.category] || 'Uncategorized',
+              description: data[mapping.description] || '',
+              tags: [],
+              rowNumber: processedRows
+            };
+
+            // Validate required fields
+            if (!transaction.date || isNaN(transaction.date.getTime())) {
+              errors.push({ row: processedRows, error: 'Invalid date format', data: data });
+              return;
+            }
+
+            if (transaction.amount <= 0) {
+              errors.push({ row: processedRows, error: 'Invalid amount', data: data });
+              return;
+            }
+
+            if (!['income', 'expense'].includes(transaction.type)) {
+              transaction.type = 'expense';
+            }
+
+            transaction.fingerprint = buildTransactionFingerprint(transaction);
+
+            allTransactions.push(transaction);
+          } catch (error) {
+            errors.push({ row: processedRows, error: error.message, data: data });
+          }
+        })
+        .on('end', resolve)
+        .on('error', reject);
+    });
+
+    console.log(`Processed ${processedRows} rows, ${allTransactions.length} valid transactions`);
+
+    if (allTransactions.length > 0) {
+      const fingerprints = allTransactions.map(t => t.fingerprint);
+
+      let existingTransactions = [];
+      try {
+        existingTransactions = await Transaction.find({
+          fingerprint: { $in: fingerprints },
+          isDeleted: false,
+          userId: req.userId
+        }).lean().maxTimeMS(8000);
+      } catch (dbError) {
+        console.error('Database query error:', dbError.message);
+      }
+
+      const existingFingerprints = new Set(existingTransactions.map(t => t.fingerprint));
+
+      allTransactions.forEach(transaction => {
+        if (existingFingerprints.has(transaction.fingerprint)) {
+          duplicateCount++;
+          errors.push({
+            row: transaction.rowNumber,
+            error: 'Duplicate transaction (already exists)',
+            data: transaction,
+            isDuplicate: true
+          });
+        } else {
+          validTransactions.push(transaction);
+        }
+      });
+    }
+
+    const result = {
+      success: true,
+      dryRun: true,
+      summary: {
+        totalRows: processedRows,
+        validRows: validTransactions.length,
+        errorRows: errors.filter(e => !e.isDuplicate).length,
+        duplicateRows: duplicateCount,
+        totalErrors: errors.length
+      },
+      validation: {
+        validTransactions: validTransactions.slice(0, 5),
+        errors: errors.slice(0, 10),
+        duplicates: errors.filter(e => e.isDuplicate)
+      }
+    };
+
+    console.log('Dry run result:', result);
+    res.json(result);
+  } catch (error) {
+    console.error('CSV dry run error:', error);
+    res.status(500).json({ error: 'Failed to validate CSV file' });
+  }
+});
+
+// Import History Endpoint
+app.get('/api/csv/history', authenticateToken, async (req, res) => {
+  try {
+    const history = await ImportHistory.find({ userId: req.userId })
+      .sort({ importDate: -1 })
+      .limit(50);
+    res.json(history);
+  } catch (error) {
+    console.error('Fetch history error:', error);
+    res.status(500).json({ error: 'Failed to fetch import history' });
+  }
+});
+
+// Routes for Salary Planner, Transactions, Budgets, Auth, etc.
+app.get('/api/transactions', authenticateToken, async (req, res) => {
+  try {
+    const { page = 1, limit = 50, type, category, search, startDate, endDate } = req.query;
+    const filter = { isDeleted: false, userId: req.userId };
+
+    if (type) filter.type = type;
+    if (category) filter.category = category;
+
+    // Add date range filtering
+    if (startDate || endDate) {
+      filter.date = {};
+      if (startDate) {
+        filter.date.$gte = new Date(startDate);
+      }
+      if (endDate) {
+        filter.date.$lte = new Date(endDate);
+      }
+    }
+
+    // Add search functionality
+    if (search) {
+      filter.$or = [
+        { description: { $regex: search, $options: 'i' } },
+        { category: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
+
+    const transactions = await Transaction.find(filter)
+      .sort({ date: -1, createdAt: -1, _id: -1 })
+      .skip(skip)
+      .limit(limitNum);
+
+    const total = await Transaction.countDocuments(filter);
+
+    res.json({
+      transactions,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        totalPages: Math.ceil(total / limitNum)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch transactions' });
+  }
+});
+
+app.post('/api/transactions', authenticateToken, async (req, res) => {
+  try {
+    console.log('📝 Creating new transaction:', req.body);
+    const transactionData = { ...req.body, userId: req.userId };
+    const transaction = new Transaction(transactionData);
+    await transaction.save();
+    
+    console.log(`✅ Transaction created: ${transaction.description} (${transaction.type}: ${transaction.amount}, category: ${transaction.category})`);
+    
+    // Update budget spent amount for this transaction's category
+    if (transaction.type === 'expense') {
+      console.log('💸 This is an expense transaction, updating budget...');
+      await updateBudgetSpentAmount(req.userId, transaction.category);
+    } else {
+      console.log('💰 This is an income transaction, skipping budget update');
+    }
+    
+    // Emit real-time event
+    req.app.emit('transaction-updated', { userId: req.userId, action: 'create', transaction });
+    
+    res.status(201).json(transaction);
+  } catch (error) {
+    console.error('❌ Failed to create transaction:', error);
+    res.status(500).json({ error: 'Failed to create transaction' });
+  }
+});
+
+app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
+  try {
+    // Get the transaction before deleting to capture its category and type
+    const transaction = await Transaction.findOne({ _id: req.params.id, userId: req.userId });
+    
+    if (!transaction) {
+      return res.status(404).json({ error: 'Transaction not found' });
+    }
+
+    const result = await Transaction.findOneAndUpdate(
+      { _id: req.params.id, userId: req.userId },
+      { isDeleted: true },
+      { new: true }
+    );
+
+    // Update budget spent amount if this was an expense transaction
+    if (transaction.type === 'expense') {
+      await updateBudgetSpentAmount(req.userId, transaction.category);
+    }
+
+    // Emit real-time event
+    req.app.emit('transaction-updated', { userId: req.userId, action: 'delete', transaction });
+
+    res.json({ success: true, message: 'Transaction deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete transaction' });
+  }
+});
+
+app.put('/api/transactions/:id', authenticateToken, async (req, res) => {
+  try {
+    const { date, amount, type, category, description } = req.body;
+
+    // Get the original transaction before updating
+    const originalTransaction = await Transaction.findOne({ _id: req.params.id, userId: req.userId });
+    
+    if (!originalTransaction) {
+      return res.status(404).json({ error: 'Transaction not found' });
+    }
+
+    const updatedTransaction = await Transaction.findOneAndUpdate(
+      { _id: req.params.id, userId: req.userId },
+      {
+        date: new Date(date),
+        amount: parseFloat(amount),
+        type,
+        category,
+        description
+      },
+      { new: true, runValidators: true }
+    );
+
+    // Update budget spent amounts for both old and new categories if they're expense transactions
+    if (originalTransaction.type === 'expense') {
+      await updateBudgetSpentAmount(req.userId, originalTransaction.category);
+    }
+    if (updatedTransaction.type === 'expense') {
+      await updateBudgetSpentAmount(req.userId, updatedTransaction.category);
+    }
+
+    // Emit real-time event
+    req.app.emit('transaction-updated', { userId: req.userId, action: 'update', transaction: updatedTransaction });
+
+    res.json(updatedTransaction);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update transaction' });
+  }
+});
+
+app.get('/api/transactions/summary', authenticateToken, async (req, res) => {
+  try {
+    const cacheKey = buildCacheKey(req.userId, 'transactions-summary');
+    const cachedSummary = getCachedValue(summaryCache, cacheKey);
+    if (cachedSummary) {
+      return res.json(cachedSummary);
+    }
+
+    let userId = req.userId;
+    if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+      userId = new mongoose.Types.ObjectId(userId);
+    }
+
+    const summary = await Transaction.aggregate([
+      { $match: { isDeleted: false, userId } },
+      {
+        $group: {
+          _id: '$type',
+          total: { $sum: '$amount' },
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    let totalIncome = 0;
+    let totalExpenses = 0;
+
+    summary.forEach(item => {
+      if (item._id === 'income') totalIncome = item.total;
+      if (item._id === 'expense') totalExpenses = item.total;
+    });
+
+    const payload = {
+      totalIncome,
+      totalExpenses,
+      netFlow: totalIncome - totalExpenses
+    };
+
+    setCachedValue(summaryCache, cacheKey, payload, SUMMARY_CACHE_TTL_MS);
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch summary' });
+  }
+});
+
+app.get('/api/analytics', authenticateToken, analyticsController.getAnalytics);
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'ledgerflow-backend'
+  });
+});
+
+// Salary Planner Routes
+app.get('/api/salary-planner', authenticateToken, salaryPlannerController.getSalaryPlanner);
+app.put('/api/salary-planner', authenticateToken, salaryPlannerController.updateSalaryPlanner);
+app.post('/api/salary-planner/fixed-bill', authenticateToken, salaryPlannerController.addFixedBill);
+app.put('/api/salary-planner/fixed-bill', authenticateToken, salaryPlannerController.updateFixedBill);
+app.delete('/api/salary-planner/fixed-bill', authenticateToken, salaryPlannerController.deleteFixedBill);
+app.put('/api/salary-planner/variable-expense', authenticateToken, salaryPlannerController.updateVariableExpense);
+app.post('/api/salary-planner/savings-goal', authenticateToken, salaryPlannerController.addSavingsGoal);
+app.put('/api/salary-planner/savings-goal', authenticateToken, salaryPlannerController.updateSavingsGoal);
+app.delete('/api/salary-planner/savings-goal', authenticateToken, salaryPlannerController.deleteSavingsGoal);
+app.post('/api/salary-planner/subscription', authenticateToken, salaryPlannerController.addSubscription);
+app.put('/api/salary-planner/subscription', authenticateToken, salaryPlannerController.updateSubscription);
+app.delete('/api/salary-planner/subscription', authenticateToken, salaryPlannerController.deleteSubscription);
+app.get('/api/salary-planner/subscriptions', authenticateToken, salaryPlannerController.getSubscriptionSummary);
+app.put('/api/salary-planner/cumulative-savings', authenticateToken, salaryPlannerController.updateCumulativeSavings);
+app.get('/api/salary-planner/cumulative-savings', authenticateToken, salaryPlannerController.getCumulativeSavings);
+
+// Debt Manager Routes
+app.post('/api/debts', authenticateToken, debtController.createDebt);
+app.get('/api/debts', authenticateToken, debtController.getAllDebts);
+app.get('/api/debts/:id', authenticateToken, debtController.getDebtById);
+app.patch('/api/debts/:id', authenticateToken, debtController.updateDebt);
+app.patch('/api/debts/:id/close', authenticateToken, debtController.closeDebt);
+app.delete('/api/debts/:id', authenticateToken, debtController.deleteDebt);
+app.post('/api/debts/:id/payments', authenticateToken, debtController.addPayment);
+app.get('/api/debts/:id/payments', authenticateToken, debtController.getDebtPayments);
+app.patch('/api/debts/:id/payments/:paymentId', authenticateToken, debtController.updatePayment);
+app.delete('/api/debts/:id/payments/:paymentId', authenticateToken, debtController.deletePayment);
+
+// Portfolio Manager Routes
+app.get('/api/portfolio', authenticateToken, portfolioController.getPortfolio);
+app.post('/api/portfolio', authenticateToken, portfolioController.addHolding);
+app.put('/api/portfolio/:id', authenticateToken, portfolioController.updateHolding);
+app.delete('/api/portfolio/:id', authenticateToken, portfolioController.deleteHolding);
+app.post('/api/portfolio/update-prices', authenticateToken, portfolioController.updatePrices);
+app.get('/api/portfolio/analytics', authenticateToken, portfolioController.getPortfolioAnalytics);
+app.get('/api/stocks/search', authenticateToken, portfolioController.searchStocks);
+app.get('/api/stocks/quote/:symbol', authenticateToken, portfolioController.getStockQuote);
+app.get('/api/stocks/historical/:symbol', authenticateToken, portfolioController.getHistoricalData);
+app.get('/api/stocks/overview/:symbol', authenticateToken, portfolioController.getCompanyOverview);
+
+// Log all incoming requests to debug
+app.use((req, res, next) => {
+  if (req.path.includes('/api/transactions') && req.method !== 'GET') {
+    console.log(`🔍 ${req.method} ${req.path}`, {
+      body: req.body,
+      headers: req.headers,
+      userId: req.userId
+    });
+  }
+  next();
+});
+
+// Helper function to update budget spent amounts
+const updateBudgetSpentAmount = async (userId, category) => {
+  try {
+    console.log(`🔧 Updating budget spent amount for userId: ${userId}, category: ${category}`);
+    
+    if (!category) {
+      console.log('❌ No category provided, skipping budget update');
+      return;
+    }
+    
+    // Calculate total spent for this category from non-deleted expense transactions
+    const totalSpent = await Transaction.aggregate([
+      {
+        $match: {
+          userId: new mongoose.Types.ObjectId(userId),
+          category: category,
+          type: 'expense',
+          isDeleted: false
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: '$amount' }
+        }
+      }
+    ]);
+    
+    const spentAmount = totalSpent.length > 0 ? totalSpent[0].total : 0;
+    console.log(`💰 Calculated spent amount for "${category}": ${spentAmount}`);
+    
+    // Update all budgets for this category
+    const updateResult = await Budget.updateMany(
+      { 
+        userId: new mongoose.Types.ObjectId(userId),
+        category: category
+      },
+      { 
+        spent: spentAmount,
+        remaining: { $subtract: ['$amount', spentAmount] }
+      }
+    );
+    
+    console.log(`✅ Updated ${updateResult.modifiedCount} budgets for category "${category}" with spent amount: ${spentAmount}`);
+  } catch (error) {
+    console.error('❌ Error updating budget spent amount:', error);
+  }
+};
+
+// Budget Logic
+const getBudgetStatus = (budget) => {
+  const amount = Number(budget.amount) || 0;
+  const spent = Number(budget.spent) || 0;
+  if (amount <= 0) return 'under';
+  const usedPercentage = (spent / amount) * 100;
+  if (usedPercentage > 100) return 'over';
+  if (usedPercentage >= 75) return 'on-track';
+  return 'under';
+};
+
+app.get('/api/budgets', authenticateToken, async (req, res) => {
+  try {
+    const budgets = await Budget.find({ userId: req.userId }).sort({ createdAt: -1 }).lean();
+    const withStatus = budgets.map((budget) => ({
+      ...budget,
+      remaining: (Number(budget.amount) || 0) - (Number(budget.spent) || 0),
+      status: getBudgetStatus(budget)
+    }));
+    res.json(withStatus);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch budgets' });
+  }
+});
+
+app.post('/api/budgets', authenticateToken, async (req, res) => {
+  try {
+    const { name, amount, spent = 0, category, period = 'Monthly' } = req.body;
+    if (!name || !category || Number(amount) <= 0) {
+      return res.status(400).json({ error: 'name, category and positive amount are required' });
+    }
+    const safeAmount = Number(amount);
+    const safeSpent = Number(spent) || 0;
+    const createdBudget = await Budget.create({
+      userId: req.userId,
+      name: String(name).trim(),
+      amount: safeAmount,
+      spent: safeSpent,
+      remaining: safeAmount - safeSpent,
+      category: String(category).trim(),
+      period: String(period || 'Monthly').trim()
+    });
+    
+    // Emit real-time event
+    req.app.emit('budget-updated', { userId: req.userId, action: 'create', budget: createdBudget });
+    
+    res.status(201).json({
+      ...createdBudget.toObject(),
+      status: getBudgetStatus(createdBudget)
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create budget' });
+  }
+});
+
+app.put('/api/budgets/:id', authenticateToken, async (req, res) => {
+  try {
+    const updates = {};
+    const allowedFields = ['name', 'amount', 'spent', 'category', 'period'];
+    allowedFields.forEach((field) => {
+      if (req.body[field] !== undefined) {
+        updates[field] = req.body[field];
+      }
+    });
+    if (updates.amount !== undefined) updates.amount = Number(updates.amount);
+    if (updates.spent !== undefined) updates.spent = Number(updates.spent);
+    if (updates.name !== undefined) updates.name = String(updates.name).trim();
+    if (updates.category !== undefined) updates.category = String(updates.category).trim();
+    if (updates.period !== undefined) updates.period = String(updates.period).trim();
+
+    const existing = await Budget.findOne({ _id: req.params.id, userId: req.userId });
+    if (!existing) {
+      return res.status(404).json({ error: 'Budget not found' });
+    }
+    const nextAmount = updates.amount !== undefined ? updates.amount : Number(existing.amount) || 0;
+    const nextSpent = updates.spent !== undefined ? updates.spent : Number(existing.spent) || 0;
+    if (nextAmount <= 0) {
+      return res.status(400).json({ error: 'Amount must be greater than 0' });
+    }
+    if (nextSpent < 0) {
+      return res.status(400).json({ error: 'Spent cannot be negative' });
+    }
+    updates.remaining = nextAmount - nextSpent;
+    const updatedBudget = await Budget.findOneAndUpdate(
+      { _id: req.params.id, userId: req.userId },
+      updates,
+      { new: true, runValidators: true }
+    );
+    
+    // Emit real-time event
+    req.app.emit('budget-updated', { userId: req.userId, action: 'update', budget: updatedBudget });
+    
+    res.json({
+      ...updatedBudget.toObject(),
+      status: getBudgetStatus(updatedBudget)
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update budget' });
+  }
+});
+
+app.delete('/api/budgets/:id', authenticateToken, async (req, res) => {
+  try {
+    const deletedBudget = await Budget.findOneAndDelete({ _id: req.params.id, userId: req.userId });
+    if (!deletedBudget) {
+      return res.status(404).json({ error: 'Budget not found' });
+    }
+    
+    // Emit real-time event
+    req.app.emit('budget-updated', { userId: req.userId, action: 'delete', budget: deletedBudget });
+    
+    res.json({ success: true, message: 'Budget deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete budget' });
+  }
+});
+
+// Authentication Routes
+app.post('/api/auth/register', register);
+app.post('/api/auth/login', login);
+app.get('/api/auth/profile', authenticateToken, getProfile);
+app.put('/api/auth/profile', authenticateToken, updateProfile);
+app.put('/api/auth/update-password', authenticateToken, updatePassword);
+
+// Clear All Data Endpoint
+app.delete('/api/clear-all-data', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.userId;
+
+    // Delete all user data from all collections
+    await Promise.all([
+      Transaction.deleteMany({ userId }),
+      Budget.deleteMany({ userId }),
+      Debt.deleteMany({ userId }),
+      DebtPayment.deleteMany({ userId }),
+      SalaryPlanner.deleteMany({ userId }),
+      ImportHistory.deleteMany({ userId })
+    ]);
+    invalidateUserCaches(userId);
+
+    console.log(`All data cleared for user: ${userId}`);
+
+    res.json({
+      message: 'All data cleared successfully',
+      clearedCollections: ['transactions', 'budgets', 'debts', 'debtPayments', 'salaryPlanner', 'importHistory']
+    });
+  } catch (error) {
+    console.error('Error clearing all data:', error);
+    res.status(500).json({ error: 'Failed to clear all data' });
+  }
+});
+
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Something went wrong!' });
+});
+
+// Server is started after successful MongoDB connection in connectWithRetry()

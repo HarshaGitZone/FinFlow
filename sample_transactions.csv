@@ -1,0 +1,40 @@
+Date,Description,Amount,Category,Type
+15-01-2024,Grocery Store,4567,Food,expense
+16-01-2024,Salary Deposit,250000,Salary,income
+17-01-2024,Gas Station,3520,Transportation,expense
+18-01-2024,Netflix Subscription,1599,Entertainment,expense
+19-01-2024,Freelance Project,50000,Freelance,income
+20-01-2024,Restaurant,2850,Food,expense
+21-01-2024,Electric Bill,8500,Utilities,expense
+22-01-2024,Gym Membership,2999,Health,expense
+23-01-2024,Investment Return,15000,Investments,income
+24-01-2024,Amazon Purchase,6789,Shopping,expense
+25-01-2024,Grocery Store,5231,Food,expense
+26-01-2024,Phone Bill,4500,Utilities,expense
+27-01-2024,Coffee Shop,475,Food,expense
+28-01-2024,Bonus Payment,75000,Bonus,income
+29-01-2024,Car Insurance,12000,Insurance,expense
+30-01-2024,Grocery Store,3892,Food,expense
+31-01-2024,Rent Payment,120000,Housing,expense
+01-02-2024,Side Hustle,20000,Freelance,income
+02-02-2024,Gas Station,4215,Transportation,expense
+03-02-2024,Movie Tickets,2500,Entertainment,expense
+04-02-2024,Grocery Store,4178,Food,expense
+05-02-2024,Internet Bill,6000,Utilities,expense
+06-02-2024,Pharmacy,1845,Health,expense
+07-02-2024,Dividend Payment,3550,Investments,income
+08-02-2024,Restaurant,3325,Food,expense
+09-02-2024,Clg expenses,2230,Education,expense
+10-02-2024,Office supplies,1500,Office,expense
+10-02-2024,Office supplies2,1500,Office,expense
+11-02-2024,Office supplies3,1500,Office,expense
+12-02-2024,Clg expenses,2230,Education,expense
+13-02-2024,Office supplies,1500,Office,expense
+13-02-2024,Office supplies2,1500,Office,expense
+01-01-2025,biriyani,3500,Food,expense
+01-01-2025,loan,20000,Loan,income
+2025-13-13,l3o,25000,Loan,income
+01-01-2025,jk,-56000,Office,expense
+01-12-2026,lymn,25000,Loan,income
+01-01-2026,lymn,27000,Ramc,income
+01-12-2026,lymn,25000,Loan,income
