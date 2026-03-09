@@ -1,6 +1,6 @@
-﻿# LuiFlow - Personal Finance Tracker
+﻿# FinFlow - Personal Finance Tracker
 
-LuiFlow is a full-stack personal finance web app for tracking transactions, budgeting, debt repayment, salary planning, analytics, and stock portfolio performance.
+FinFlow is a full-stack personal finance web app for tracking transactions, budgeting, debt repayment, salary planning, analytics, and stock portfolio performance.
 
 ---
 ## Deployed Website Link
@@ -101,7 +101,7 @@ https://drive.google.com/file/d/1thcU6A24lP53D-6aLuGj6aMRhO2bEzOQ/view?usp=shari
 ## Project Structure
 
 ```text
-LuiFlow/
+FinFlow/
 |- frontend/
 |  |- src/
 |  |  |- components/
